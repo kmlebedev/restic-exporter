@@ -4,15 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type resticData struct {
@@ -94,6 +93,14 @@ func probeHandler(w http.ResponseWriter, r *http.Request) {
 			},
 			[]string{"hostname", "paths", "tags"},
 		)
+		locks_latest_time = prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: "restic",
+				Subsystem: "locks",
+				Name:      "latest_time",
+				Help:      "Time of the latest lock",
+			},
+		)
 	)
 
 	ctx, cancel := context.WithCancel(r.Context())
@@ -117,23 +124,30 @@ func probeHandler(w http.ResponseWriter, r *http.Request) {
 	registry.MustRegister(latest_total_nfiles)
 	registry.MustRegister(snapshots_latest_time)
 
-	args := []string{"latest", "--cache-dir", envCacheDir, "--json"}
+	baseArgs := []string{"--cache-dir", envCacheDir, "--json", "--no-lock"}
+	var args []string
 	if target != "" {
-		args = append(args, "--host", target)
+		args = append(baseArgs, "--host", target)
 	}
 	if path != "" {
-		args = append(args, "--path", path)
+		args = append(baseArgs, "--path", path)
 	}
 	if tags != "" {
 		for _, tag := range strings.Split(tags, ",") {
-			args = append(args, "--tag", tag)
+			args = append(baseArgs, "--tag", tag)
 		}
 	}
-	resticStatsCmd := exec.Command(envResticBin, append([]string{"stats"}, args...)...)
-	resticSnapshotsCmd := exec.Command(envResticBin, append([]string{"snapshots"}, args...)...)
+	resticLocksCmd := exec.Command(envResticBin, append([]string{"list", "locks"}, baseArgs...)...)
+	resticStatsCmd := exec.Command(envResticBin, append([]string{"stats", "latest"}, args...)...)
+	resticSnapshotsCmd := exec.Command(envResticBin, append([]string{"snapshots", "latest"}, args...)...)
 
 	var rd resticData
-
+	if stdOut, err := stdOutFromCmd(resticLocksCmd); err != nil {
+		log.Println(err)
+		return
+	} else if len(stdOut.Bytes()) > 0 {
+		locks_latest_time.SetToCurrentTime()
+	}
 	if err := unmarshallFromCmd(resticStatsCmd, &rd.Stats); err != nil {
 		log.Println(err)
 		return
@@ -163,8 +177,7 @@ func probeHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func unmarshallFromCmd(cmd *exec.Cmd, out interface{}) error {
-
+func stdOutFromCmd(cmd *exec.Cmd) (*bytes.Buffer, error) {
 	var (
 		stdOut bytes.Buffer
 		stdErr bytes.Buffer
@@ -177,6 +190,14 @@ func unmarshallFromCmd(cmd *exec.Cmd, out interface{}) error {
 	err = cmd.Run()
 	if err != nil {
 		log.Printf("Error occured while running '%s': %s\n", cmd.String(), stdErr.String())
+		return nil, err
+	}
+	return &stdOut, nil
+}
+
+func unmarshallFromCmd(cmd *exec.Cmd, out interface{}) error {
+	stdOut, err := stdOutFromCmd(cmd)
+	if err != nil {
 		return err
 	}
 
@@ -185,5 +206,4 @@ func unmarshallFromCmd(cmd *exec.Cmd, out interface{}) error {
 	}
 
 	return nil
-
 }
